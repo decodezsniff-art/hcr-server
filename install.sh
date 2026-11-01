@@ -16,23 +16,20 @@ ok() { echo -e "${GREEN}[OK]${NC} $*"; }
 fail() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "Ejecuta como root."
-command -v systemctl >/dev/null || fail "systemd no disponible."
-command -v ss >/dev/null || fail "Instala iproute2."
-command -v curl >/dev/null || fail "Instala curl."
-command -v file >/dev/null || fail "Instala file."
+
+for cmd in systemctl ss curl file install; do
+    command -v "$cmd" >/dev/null || fail "Falta el comando: $cmd"
+done
+
+systemctl is-system-running >/dev/null 2>&1 ||
+    fail "systemd no está disponible o no está funcionando."
 
 ARCH="$(uname -m)"
 
 case "$ARCH" in
-    x86_64|amd64)
-        ARCH="amd64"
-        ;;
-    aarch64|arm64)
-        fail "Todavía no existe un binario ARM64 publicado."
-        ;;
-    *)
-        fail "Arquitectura no compatible: $ARCH"
-        ;;
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) fail "Todavía no existe un binario ARM64 publicado." ;;
+    *) fail "Arquitectura no compatible: $ARCH" ;;
 esac
 
 echo "=================================="
@@ -63,7 +60,8 @@ esac
 read -rp "Destino SSH [127.0.0.1:22]: " TARGET
 TARGET="${TARGET:-127.0.0.1:22}"
 
-[[ "$TARGET" =~ ^[a-zA-Z0-9_.:\[\]-]+$ ]] || fail "Destino SSH inválido."
+[[ "$TARGET" =~ ^[a-zA-Z0-9_.:\[\]-]+$ ]] ||
+    fail "Destino SSH inválido."
 
 TLS_CERT=""
 TLS_KEY=""
@@ -72,13 +70,17 @@ if [[ "$TRANSPORT" != "plain" ]]; then
     read -rp "Ruta del certificado TLS: " TLS_CERT
     read -rp "Ruta de la clave privada TLS: " TLS_KEY
 
-    [[ -f "$TLS_CERT" ]] || fail "No existe el certificado."
-    [[ -f "$TLS_KEY" ]] || fail "No existe la clave privada."
+    [[ "$TLS_CERT" =~ ^[a-zA-Z0-9_./-]+$ ]] ||
+        fail "Ruta del certificado no válida."
 
-    [[ "$TLS_CERT" =~ ^[a-zA-Z0-9_./-]+$ ]] || fail "Ruta del certificado no válida o contiene espacios."
-    [[ "$TLS_KEY" =~ ^[a-zA-Z0-9_./-]+$ ]] || fail "Ruta de la clave no válida o contiene espacios."
+    [[ "$TLS_KEY" =~ ^[a-zA-Z0-9_./-]+$ ]] ||
+        fail "Ruta de la clave no válida."
 
-    [[ -r "$TLS_CERT" && -r "$TLS_KEY" ]] || fail "No se pueden leer los archivos TLS."
+    [[ -f "$TLS_CERT" && -r "$TLS_CERT" ]] ||
+        fail "No existe o no se puede leer el certificado."
+
+    [[ -f "$TLS_KEY" && -r "$TLS_KEY" ]] ||
+        fail "No existe o no se puede leer la clave privada."
 fi
 
 echo
@@ -93,41 +95,84 @@ read -rp "¿Continuar? (s/N): " CONFIRM
 mkdir -p "$INSTALL_DIR"
 
 TMP="$(mktemp)"
-BACKUP=""
+OLD_BINARY=""
+OLD_SERVICE=""
+HAD_BINARY=0
+HAD_SERVICE=0
+CHANGED=0
+SUCCESS=0
 
 cleanup() {
     rm -f "$TMP"
+
+    if [[ "$CHANGED" -eq 1 && "$SUCCESS" -eq 0 ]]; then
+        echo "Restaurando instalación anterior..."
+
+        systemctl stop hcr-server.service 2>/dev/null || true
+
+        if [[ "$HAD_BINARY" -eq 1 ]]; then
+            cp -a "$OLD_BINARY" "$BINARY"
+        else
+            rm -f "$BINARY"
+        fi
+
+        if [[ "$HAD_SERVICE" -eq 1 ]]; then
+            cp -a "$OLD_SERVICE" "$SERVICE"
+            systemctl daemon-reload
+            systemctl restart hcr-server.service || true
+        else
+            rm -f "$SERVICE"
+            systemctl daemon-reload
+            systemctl reset-failed hcr-server.service || true
+        fi
+    fi
 }
+
 trap cleanup EXIT
 
 URL="https://raw.githubusercontent.com/$REPO/$BRANCH/hcr-server"
 
 echo "Descargando HCR Server..."
-curl -fL --retry 3 "$URL" -o "$TMP" || fail "Error de descarga."
+curl -fLsS --retry 3 "$URL" -o "$TMP" ||
+    fail "Error de descarga."
 
 [[ -s "$TMP" ]] || fail "El binario está vacío."
 
 FILE_INFO="$(file "$TMP")"
 echo "$FILE_INFO"
 
-[[ "$FILE_INFO" == *"ELF 64-bit"* && "$FILE_INFO" == *"x86-64"* ]] \
-    || fail "El binario no corresponde a Linux AMD64."
+[[ "$FILE_INFO" == *"ELF 64-bit"* && "$FILE_INFO" == *"x86-64"* ]] ||
+    fail "El binario no corresponde a Linux AMD64."
 
 chmod 755 "$TMP"
 
+VERSION="$("$TMP" -version 2>&1)" ||
+    fail "El binario descargado no puede ejecutarse."
+
+echo "Versión descargada: $VERSION"
+
 if [[ -f "$BINARY" ]]; then
-    BACKUP="$INSTALL_DIR/hcr-server.backup.$(date +%Y%m%d-%H%M%S)"
-    cp -a "$BINARY" "$BACKUP"
-    ok "Copia anterior guardada: $BACKUP"
+    OLD_BINARY="$INSTALL_DIR/hcr-server.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$BINARY" "$OLD_BINARY"
+    HAD_BINARY=1
+    ok "Copia anterior: $OLD_BINARY"
 fi
 
-install -m 755 "$TMP" "$BINARY"
+if [[ -f "$SERVICE" ]]; then
+    OLD_SERVICE="$INSTALL_DIR/hcr-server.service.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$SERVICE" "$OLD_SERVICE"
+    HAD_SERVICE=1
+fi
 
 if [[ "$TRANSPORT" == "plain" ]]; then
     EXEC_ARGS="-listen :$PORT -target $TARGET -transport $TRANSPORT"
 else
     EXEC_ARGS="-listen :$PORT -target $TARGET -transport $TRANSPORT -tls-cert $TLS_CERT -tls-key $TLS_KEY"
 fi
+
+CHANGED=1
+
+install -m 755 "$TMP" "$BINARY"
 
 cat > "$SERVICE" <<EOF
 [Unit]
@@ -148,34 +193,22 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable hcr-server
+systemctl enable hcr-server.service
 
-if ! systemctl restart hcr-server; then
-    echo "Error al iniciar. Restaurando binario anterior..."
+systemctl restart hcr-server.service ||
+    fail "No se pudo iniciar HCR."
 
-    if [[ -n "$BACKUP" ]]; then
-        cp -a "$BACKUP" "$BINARY"
-    else
-        rm -f "$BINARY" "$SERVICE"
-        systemctl daemon-reload
-        systemctl reset-failed hcr-server || true
-        fail "Instalación revertida."
-    fi
+sleep 3
 
-    systemctl daemon-reload
-    systemctl restart hcr-server || true
-    fail "No se pudo iniciar HCR. Se restauró el binario anterior."
+if ! systemctl is-active --quiet hcr-server.service; then
+    systemctl status hcr-server.service --no-pager || true
+    fail "HCR no quedó activo."
 fi
 
-sleep 2
-
-if ! systemctl is-active --quiet hcr-server; then
-    systemctl status hcr-server --no-pager || true
-    fail "HCR no quedó activo. Revisa los registros."
-fi
+SUCCESS=1
 
 ok "HCR Server instalado correctamente."
-echo "Versión: $("$BINARY" -version)"
+echo "Versión: $VERSION"
 echo "Puerto: $PORT"
 echo "Transporte: $TRANSPORT"
 echo "Destino SSH: $TARGET"
