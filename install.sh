@@ -60,7 +60,7 @@ esac
 read -rp "Destino SSH [127.0.0.1:22]: " TARGET
 TARGET="${TARGET:-127.0.0.1:22}"
 
-[[ "$TARGET" =~ ^[a-zA-Z0-9_.:\[\]-]+$ ]] ||
+[[ "$TARGET" =~ ^[a-zA-Z0-9_.:-]+$ ]] ||
     fail "Destino SSH inválido."
 
 TLS_CERT=""
